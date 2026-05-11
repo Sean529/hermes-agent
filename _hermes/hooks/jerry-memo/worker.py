@@ -283,10 +283,15 @@ def process_idea(idea_id: int) -> None:
             if copied_media:
                 md_lines += ["## 附件", ""]
                 for m, note in zip(copied_media, image_notes):
+                    # Resolve the attachment path relative to the markdown
+                    # file's directory so GitHub renders inline images
+                    # correctly (`attachments/...` from a file in `2026-05/`
+                    # would otherwise resolve to `2026-05/attachments/...`).
+                    md_rel = os.path.relpath(m["abs"], full_path.parent).replace(os.sep, "/")
                     if m["ext"] in _IMAGE_EXTS:
-                        md_lines += [f"![{Path(m['rel']).name}]({m['rel']})"]
+                        md_lines += [f"![{Path(m['rel']).name}]({md_rel})"]
                     else:
-                        md_lines += [f"- [{Path(m['rel']).name}]({m['rel']})"]
+                        md_lines += [f"- [{Path(m['rel']).name}]({md_rel})"]
                     if note:
                         md_lines += [f"  - 描述：{note}"]
                     md_lines += [""]
