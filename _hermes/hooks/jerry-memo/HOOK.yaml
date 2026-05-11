@@ -1,0 +1,4 @@
+name: jerry-memo
+description: Capture #灵感 channel messages → SQLite + background fetch/summarize/commit/push to jerry-memo repo
+events:
+  - agent:start
