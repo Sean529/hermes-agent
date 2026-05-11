@@ -4576,13 +4576,39 @@ class GatewayRunner:
             hook_ctx = {
                 "platform": source.platform.value if source.platform else "",
                 "user_id": source.user_id,
+                "user_name": getattr(source, "user_name", None),
                 "session_id": session_entry.session_id,
                 "message": message_text[:500],
+                "chat_id": source.chat_id,
+                "chat_type": source.chat_type,
+                "parent_chat_id": getattr(source, "parent_chat_id", None),
+                "thread_id": getattr(source, "thread_id", None),
+                "guild_id": getattr(source, "guild_id", None),
+                "message_id": event.message_id,
             }
-            await self.hooks.emit("agent:start", hook_ctx)
+            hook_results = await self.hooks.emit_collect("agent:start", hook_ctx)
 
-            # Run the agent
-            agent_result = await self._run_agent(
+            # Allow a hook to short-circuit the agent by returning
+            # {"decision": "handled", "message": "..."}.  Mirrors the
+            # command:* hook pattern used for slash commands.
+            agent_result = None
+            for hook_result in hook_results or []:
+                if not isinstance(hook_result, dict):
+                    continue
+                decision = str(hook_result.get("decision", "")).strip().lower()
+                if decision == "handled":
+                    sc_msg = hook_result.get("message")
+                    if isinstance(sc_msg, str) and sc_msg:
+                        agent_result = {
+                            "final_response": sc_msg,
+                            "messages": [],
+                            "api_calls": 0,
+                            "short_circuited": True,
+                        }
+                        break
+
+            if agent_result is None:
+                agent_result = await self._run_agent(
                 message=message_text,
                 context_prompt=context_prompt,
                 history=history,

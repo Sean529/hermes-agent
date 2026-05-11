@@ -1360,6 +1360,10 @@ class AIAgent:
                 elif base_url_host_matches(effective_base, "chatgpt.com"):
                     from agent.auxiliary_client import _codex_cloudflare_headers
                     client_kwargs["default_headers"] = _codex_cloudflare_headers(api_key)
+                elif base_url_host_matches(effective_base, "jccode.cc"):
+                    client_kwargs["default_headers"] = {
+                        "User-Agent": "curl/8.7.1",
+                    }
             else:
                 # No explicit creds — use the centralized provider router
                 from agent.auxiliary_client import resolve_provider_client
@@ -4903,7 +4907,7 @@ class AIAgent:
         return False
 
     @staticmethod
-    def _build_keepalive_http_client(base_url: str = "") -> Any:
+    def _build_keepalive_http_client(base_url: str = "", headers: dict = None) -> Any:
         try:
             import httpx as _httpx
             import socket as _socket
@@ -4920,10 +4924,13 @@ class AIAgent:
             # Explicitly read proxy settings while still honoring NO_PROXY for
             # loopback / local endpoints such as a locally hosted sub2api.
             _proxy = _get_proxy_for_base_url(base_url)
-            return _httpx.Client(
-                transport=_httpx.HTTPTransport(socket_options=_sock_opts),
-                proxy=_proxy,
-            )
+            client_args = {
+                "transport": _httpx.HTTPTransport(socket_options=_sock_opts),
+                "proxy": _proxy,
+            }
+            if headers:
+                client_args["headers"] = headers
+            return _httpx.Client(**client_args)
         except Exception:
             return None
 
@@ -4977,7 +4984,10 @@ class AIAgent:
                     if k in {"api_key", "base_url", "default_headers", "timeout", "http_client"}
                 }
                 if "http_client" not in safe_kwargs:
-                    keepalive_http = self._build_keepalive_http_client(base_url)
+                    keepalive_http = self._build_keepalive_http_client(
+                        base_url,
+                        safe_kwargs.get("default_headers")
+                    )
                     if keepalive_http is not None:
                         safe_kwargs["http_client"] = keepalive_http
                 client = GeminiNativeClient(**safe_kwargs)
@@ -5006,9 +5016,18 @@ class AIAgent:
         # Tests in ``tests/run_agent/test_create_openai_client_reuse.py`` and
         # ``tests/run_agent/test_sequential_chats_live.py`` pin this invariant.
         if "http_client" not in client_kwargs:
-            keepalive_http = self._build_keepalive_http_client(client_kwargs.get("base_url", ""))
+            # Keep default_headers for OpenAI SDK to use
+            headers_to_pass = client_kwargs.get("default_headers")
+            keepalive_http = self._build_keepalive_http_client(
+                client_kwargs.get("base_url", ""),
+                headers_to_pass
+            )
             if keepalive_http is not None:
                 client_kwargs["http_client"] = keepalive_http
+                # OpenAI SDK needs default_headers even when using custom http_client
+                # The SDK will merge these headers with the http_client's headers
+                if headers_to_pass:
+                    client_kwargs["default_headers"] = headers_to_pass
         client = OpenAI(**client_kwargs)
         logger.info(
             "OpenAI client created (%s, shared=%s) %s",
@@ -5592,6 +5611,10 @@ class AIAgent:
             self._client_kwargs["default_headers"] = _codex_cloudflare_headers(
                 self._client_kwargs.get("api_key", "")
             )
+        elif base_url_host_matches(base_url, "jccode.cc"):
+            self._client_kwargs["default_headers"] = {
+                "User-Agent": "curl/8.7.1",
+            }
         else:
             self._client_kwargs.pop("default_headers", None)
 

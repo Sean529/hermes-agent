@@ -699,8 +699,15 @@ class DiscordAdapter(BasePlatformAdapter):
                         m.bot and m != self._client.user
                         for m in message.mentions
                     )
+                    logger.info(
+                        "[Discord] Guild message - mentions: %s, self_mentioned: %s, other_bots: %s",
+                        [f"{m.name}(bot={m.bot})" for m in message.mentions],
+                        _self_mentioned,
+                        _other_bots_mentioned
+                    )
                     # If other bots are mentioned but we're not → not for us
                     if _other_bots_mentioned and not _self_mentioned:
+                        logger.info("[Discord] Ignoring - other bots mentioned but not us")
                         return
                     # If humans are mentioned but we're not → not for us
                     # (preserves old DISCORD_IGNORE_NO_MENTION=true behavior)
@@ -708,6 +715,7 @@ class DiscordAdapter(BasePlatformAdapter):
                         "DISCORD_IGNORE_NO_MENTION", "true"
                     ).lower() in ("true", "1", "yes")
                     if _ignore_no_mention and not _self_mentioned and not _other_bots_mentioned:
+                        logger.info("[Discord] Ignoring - humans mentioned but not us (DISCORD_IGNORE_NO_MENTION=true)")
                         return
 
                 await self._handle_message(message)
