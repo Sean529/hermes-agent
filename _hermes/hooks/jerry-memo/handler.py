@@ -2,9 +2,11 @@
 Jerry-memo hook: capture messages in Discord #灵感 channel.
 
 On each message:
-  1. Insert SQLite row → get auto-increment idea_id
-  2. Spawn background thread to fetch URLs, summarize via LLM, write
-     markdown to ~/code/jerry-memo, git commit + push.
+  1. Insert SQLite row → get auto-increment idea_id (now includes any
+     image/file attachments via ``media_paths``).
+  2. Spawn background thread to fetch URLs, copy media into the repo,
+     ask the LLM (with vision) for a Chinese summary, write markdown,
+     git commit + push.
   3. Short-circuit the agent by returning {"decision": "handled", ...}
      so the user sees a deterministic ack instead of an LLM ramble.
 """
@@ -48,6 +50,16 @@ def _ensure_db() -> sqlite3.Connection:
             error TEXT
         )
     """)
+    # v2: add columns in-place for older DBs.  sqlite has no IF NOT EXISTS
+    # for ALTER, so we just try and swallow the duplicate-column error.
+    for ddl in (
+        "ALTER TABLE ideas ADD COLUMN media_paths TEXT",
+        "ALTER TABLE ideas ADD COLUMN raw_text TEXT",
+    ):
+        try:
+            conn.execute(ddl)
+        except sqlite3.OperationalError:
+            pass
     conn.execute("CREATE INDEX IF NOT EXISTS idx_status ON ideas(status)")
     conn.execute("CREATE INDEX IF NOT EXISTS idx_created ON ideas(created_at)")
     conn.commit()
@@ -60,17 +72,24 @@ async def handle(event_type: str, context: dict):
     if (context.get("platform") or "") != "discord":
         return None
 
-    # Match either direct posts in #灵感 or any thread under it
     chat_id = str(context.get("chat_id") or "")
     parent_chat_id = str(context.get("parent_chat_id") or "")
     if chat_id != TARGET_CHANNEL_ID and parent_chat_id != TARGET_CHANNEL_ID:
         return None
 
-    message = (context.get("message") or "").strip()
-    if not message:
-        return None
+    # Prefer the raw text the user typed (pre-vision); fall back to the
+    # vision-augmented message so attachments-only posts still get
+    # recorded.
+    raw_text = (context.get("raw_text") or "").strip()
+    vision_text = (context.get("message") or "").strip()
+    content = raw_text or vision_text
+    media_paths = list(context.get("media_urls") or [])
+    media_types = list(context.get("media_types") or [])
 
-    urls = URL_RE.findall(message)
+    if not content and not media_paths:
+        return None  # nothing to capture
+
+    urls = URL_RE.findall(content)
 
     try:
         conn = _ensure_db()
@@ -78,17 +97,23 @@ async def handle(event_type: str, context: dict):
         cur.execute(
             """
             INSERT INTO ideas (discord_msg_id, chat_id, user_id, user_name,
-                               content, urls, created_at)
-            VALUES (?, ?, ?, ?, ?, ?, ?)
+                               content, urls, created_at, raw_text,
+                               media_paths)
+            VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)
             """,
             (
                 str(context.get("message_id") or ""),
                 chat_id,
                 str(context.get("user_id") or ""),
                 str(context.get("user_name") or ""),
-                message,
+                content,
                 json.dumps(urls, ensure_ascii=False),
                 datetime.now(timezone.utc).isoformat(timespec="seconds"),
+                raw_text,
+                json.dumps(
+                    list(zip(media_paths, media_types or [""] * len(media_paths))),
+                    ensure_ascii=False,
+                ),
             ),
         )
         idea_id = cur.lastrowid
@@ -100,7 +125,6 @@ async def handle(event_type: str, context: dict):
             "message": f"⚠️ jerry-memo 入库失败: {e}",
         }
 
-    # Spawn background worker (daemon thread so process exit kills it)
     if str(HOOK_DIR) not in sys.path:
         sys.path.insert(0, str(HOOK_DIR))
     try:
@@ -108,15 +132,20 @@ async def handle(event_type: str, context: dict):
     except Exception as e:
         return {
             "decision": "handled",
-            "message": f"💡 灵感#{idea_id} ✅ 已入库（worker 导入失败，将留到下次处理）: {e}",
+            "message": f"💡 灵感#{idea_id} ✅ 已入库（worker 导入失败）: {e}",
         }
     threading.Thread(target=process_idea, args=(idea_id,), daemon=True).start()
 
-    url_note = f"（含 {len(urls)} 个链接）" if urls else ""
+    notes = []
+    if urls:
+        notes.append(f"{len(urls)} 个链接")
+    if media_paths:
+        notes.append(f"{len(media_paths)} 张图片/附件")
+    extra = f"（含 {'、'.join(notes)}）" if notes else ""
     return {
         "decision": "handled",
         "message": (
-            f"💡 灵感#{idea_id} ✅ 已入队{url_note}\n"
-            f"→ 后台处理（fetch → 中文总结 → 归档 → push）"
+            f"💡 灵感#{idea_id} ✅ 已入队{extra}\n"
+            f"→ 后台处理（fetch → 视觉描述 → 中文总结 → 归档 → push）"
         ),
     }

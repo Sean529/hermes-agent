@@ -1,14 +1,18 @@
 """
 Background processor for jerry-memo ideas.
 
-Picks pending rows, fetches any URLs, asks the LLM for a Chinese summary +
-tags, writes a markdown file to ~/code/jerry-memo, and commits/pushes.
+Picks pending rows, fetches any URLs, copies attached media into the
+repo, runs the LLM (with vision) for a Chinese summary + tags, writes
+a markdown file under ``~/code/jerry-memo``, then commits + pushes.
 """
 from __future__ import annotations
 
+import base64
 import json
+import mimetypes
 import os
 import re
+import shutil
 import sqlite3
 import subprocess
 import threading
@@ -25,6 +29,8 @@ REPO_PATH = Path(os.environ.get("JERRY_MEMO_REPO", os.path.expanduser("~/code/je
 
 _GIT_LOCK = threading.Lock()
 
+_IMAGE_EXTS = {".png", ".jpg", ".jpeg", ".gif", ".webp"}
+
 
 def _log(msg: str) -> None:
     LOG_PATH.parent.mkdir(parents=True, exist_ok=True)
@@ -33,7 +39,6 @@ def _log(msg: str) -> None:
 
 
 def _load_env() -> None:
-    """Best-effort load of ~/.hermes/.env into os.environ (does not overwrite)."""
     env_path = HERMES_HOME / ".env"
     if not env_path.exists():
         return
@@ -72,10 +77,9 @@ def _fetch_url(url: str) -> str:
         return f"[fetch error: {e}]"
 
 
-def _llm_chat(messages: list[dict], timeout: float = 120.0) -> str:
-    """Plain OpenAI-compatible chat completion via httpx — the openai SDK
-    adds default headers that jccode.cc rejects, so we call the endpoint
-    directly."""
+def _llm_chat(messages: list[dict], timeout: float = 180.0) -> str:
+    """OpenAI-compatible chat completion via httpx — bypasses the openai
+    SDK because jccode.cc rejects its default headers."""
     _load_env()
     api_key = os.environ.get("OPENAI_API_KEY", "")
     base_url = os.environ.get("OPENAI_BASE_URL", "https://jccode.cc/v1").rstrip("/")
@@ -93,17 +97,89 @@ def _llm_chat(messages: list[dict], timeout: float = 120.0) -> str:
         return (r.json()["choices"][0]["message"]["content"] or "").strip()
 
 
-def _llm_summarize(content: str, fetched: dict[str, str]) -> dict:
-    parts = [f"用户消息：\n{content}"]
+def _describe_image(image_path: Path) -> str:
+    """Ask the LLM to briefly describe one image.  Returns a short
+    Chinese description or an empty string on failure."""
+    try:
+        mime = mimetypes.guess_type(image_path.name)[0] or "image/png"
+        with image_path.open("rb") as f:
+            b64 = base64.b64encode(f.read()).decode("ascii")
+        data_url = f"data:{mime};base64,{b64}"
+        out = _llm_chat(
+            [
+                {
+                    "role": "system",
+                    "content": "你是一个简洁的图像描述助手。用 1-3 句中文描述图片里的关键信息（界面元素、文字、数据、人物动作等）。只输出描述，不要前缀和编号。",
+                },
+                {
+                    "role": "user",
+                    "content": [
+                        {"type": "text", "text": "描述这张图："},
+                        {"type": "image_url", "image_url": {"url": data_url}},
+                    ],
+                },
+            ],
+            timeout=120,
+        )
+        return out.strip()
+    except Exception as e:
+        _log(f"vision failed for {image_path}: {e}")
+        return ""
+
+
+def _copy_media(idea_id: int, ym: str, media_entries: list) -> tuple[list[dict], list[str]]:
+    """Copy media files into the repo.  Returns ([{rel, src, type, ext}, ...], errors)."""
+    errors: list[str] = []
+    out: list[dict] = []
+    if not media_entries:
+        return out, errors
+    dst_dir = REPO_PATH / "attachments" / ym / f"{idea_id:04d}"
+    dst_dir.mkdir(parents=True, exist_ok=True)
+    for entry in media_entries:
+        # tolerate either ["path", "type"] tuples or bare path strings
+        if isinstance(entry, (list, tuple)) and entry:
+            src_str = entry[0]
+            mime = entry[1] if len(entry) > 1 else ""
+        else:
+            src_str, mime = str(entry), ""
+        src = Path(src_str).expanduser()
+        if not src.exists():
+            errors.append(f"missing: {src}")
+            continue
+        dst = dst_dir / src.name
+        try:
+            shutil.copy2(src, dst)
+        except Exception as e:
+            errors.append(f"copy {src} → {dst}: {e}")
+            continue
+        out.append({
+            "rel": str(dst.relative_to(REPO_PATH)),
+            "abs": str(dst),
+            "type": mime,
+            "ext": src.suffix.lower(),
+        })
+    return out, errors
+
+
+def _llm_summarize(content: str, fetched: dict[str, str], image_notes: list[str]) -> dict:
+    parts = []
+    if content:
+        parts.append(f"用户消息：\n{content}")
     for url, body in fetched.items():
         parts.append(f"\n链接 {url} 抓取内容（前 8k 字符）：\n{body[:8000]}")
+    if image_notes:
+        joined = "\n".join(f"- 图{i+1}：{n}" for i, n in enumerate(image_notes) if n)
+        if joined:
+            parts.append(f"\n附件图像的视觉描述：\n{joined}")
+    if not parts:
+        return {"summary": "", "tags": []}
     user_msg = "\n".join(parts)[:20000]
 
     sys_prompt = (
-        "你是 Jerry 的个人灵感整理助手。用户在 Discord #灵感 频道发了一条想法（可能含链接）。\n"
+        "你是 Jerry 的个人灵感整理助手。用户在 Discord #灵感 频道发了一条想法（可能含链接和/或图片）。\n"
         "任务：\n"
-        "1) 用 2-5 句中文总结这条灵感的核心要点。如果有链接，融合链接内容。\n"
-        "2) 给 1-4 个简短中文标签（如 #产品 #trading #学习 #购物 #想法 #工具 #生活 等）。\n"
+        "1) 用 2-5 句中文总结这条灵感的核心要点；融合链接内容与图像描述。\n"
+        "2) 给 1-4 个简短中文标签（如 #产品 #trading #学习 #购物 #想法 #工具 #生活 #UI 等）。\n"
         "\n严格只输出 JSON，无其他文字：\n"
         '{"summary": "中文总结...", "tags": ["产品", "学习"]}'
     )
@@ -136,8 +212,10 @@ def process_idea(idea_id: int) -> None:
     conn = sqlite3.connect(DB_PATH)
     try:
         cur = conn.cursor()
+        # Allow reprocessing of done rows too — useful when fixing a
+        # bug and regenerating.  Pending/failed are the normal path.
         cur.execute(
-            "UPDATE ideas SET status='processing' WHERE id=? AND status IN ('pending','failed')",
+            "UPDATE ideas SET status='processing' WHERE id=?",
             (idea_id,),
         )
         if cur.rowcount == 0:
@@ -145,27 +223,46 @@ def process_idea(idea_id: int) -> None:
         conn.commit()
 
         cur.execute(
-            "SELECT content, urls, user_name, created_at FROM ideas WHERE id=?",
+            "SELECT content, urls, user_name, created_at, media_paths FROM ideas WHERE id=?",
             (idea_id,),
         )
         row = cur.fetchone()
         if not row:
             return
-        content, urls_json, user_name, created_at = row
+        content, urls_json, user_name, created_at, media_json = row
         urls = json.loads(urls_json or "[]")
+        media_entries = json.loads(media_json or "[]")
 
         try:
+            now = datetime.now(timezone.utc).astimezone()
+            ym = now.strftime("%Y-%m")
+
+            # 1) Copy media files into the repo first so we have stable
+            # paths to reference in the markdown body.
+            copied_media, media_errors = _copy_media(idea_id, ym, media_entries)
+            for err in media_errors:
+                _log(f"idea#{idea_id} media warn: {err}")
+
+            # 2) Vision-describe each image (best-effort)
+            image_notes: list[str] = []
+            for m in copied_media:
+                if m["ext"] in _IMAGE_EXTS:
+                    image_notes.append(_describe_image(Path(m["abs"])))
+                else:
+                    image_notes.append("")
+
+            # 3) Fetch URLs
             fetched = {u: _fetch_url(u) for u in urls}
-            result = _llm_summarize(content, fetched)
+
+            # 4) Summarize
+            result = _llm_summarize(content, fetched, image_notes)
             summary = (result.get("summary") or "").strip()
             tags = result.get("tags") or []
             if not isinstance(tags, list):
                 tags = [str(tags)]
             tags = [str(t).lstrip("#").strip() for t in tags if t]
 
-            now = datetime.now(timezone.utc).astimezone()
-            ym = now.strftime("%Y-%m")
-            slug = _slugify(summary or content)
+            slug = _slugify(summary or content or "image-only")
             rel_path = f"{ym}/{idea_id:04d}-{slug}.md"
             full_path = REPO_PATH / rel_path
             full_path.parent.mkdir(parents=True, exist_ok=True)
@@ -178,13 +275,21 @@ def process_idea(idea_id: int) -> None:
                 f"- user: {user_name}",
                 f"- tags: {tag_line}",
                 "",
-                "## 原文",
-                "",
-                content,
-                "",
             ]
+            if content:
+                md_lines += ["## 原文", "", content, ""]
             if summary:
                 md_lines += ["## 总结", "", summary, ""]
+            if copied_media:
+                md_lines += ["## 附件", ""]
+                for m, note in zip(copied_media, image_notes):
+                    if m["ext"] in _IMAGE_EXTS:
+                        md_lines += [f"![{Path(m['rel']).name}]({m['rel']})"]
+                    else:
+                        md_lines += [f"- [{Path(m['rel']).name}]({m['rel']})"]
+                    if note:
+                        md_lines += [f"  - 描述：{note}"]
+                    md_lines += [""]
             if urls:
                 md_lines += ["## 链接", ""]
                 for u in urls:
@@ -193,10 +298,20 @@ def process_idea(idea_id: int) -> None:
                     md_lines += [f"### {u}", "", snippet, ""]
             full_path.write_text("\n".join(md_lines), encoding="utf-8")
 
+            # Clean up any stale prior file for this idea (slug may have changed)
+            for old in (REPO_PATH / ym).glob(f"{idea_id:04d}-*.md"):
+                if old != full_path:
+                    try:
+                        old.unlink()
+                    except Exception:
+                        pass
+
             with _GIT_LOCK:
                 _git("pull", "--rebase", "origin", "main")
-                _git("add", str(full_path.relative_to(REPO_PATH)))
-                first_line = (summary or content)[:60].replace("\n", " ")
+                _git("add", "-A", ym)
+                if copied_media:
+                    _git("add", "-A", "attachments")
+                first_line = (summary or content or "image-only")[:60].replace("\n", " ")
                 commit = _git("commit", "-m", f"idea#{idea_id}: {first_line}")
                 if commit.returncode != 0 and "nothing to commit" not in commit.stdout.lower():
                     raise RuntimeError(f"git commit failed: {commit.stderr}")
@@ -221,7 +336,7 @@ def process_idea(idea_id: int) -> None:
                 ),
             )
             conn.commit()
-            _log(f"idea#{idea_id} done -> {rel_path}")
+            _log(f"idea#{idea_id} done -> {rel_path} (media={len(copied_media)})")
         except Exception as e:
             cur.execute(
                 "UPDATE ideas SET status='failed', error=? WHERE id=?",
