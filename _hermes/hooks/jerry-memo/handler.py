@@ -27,6 +27,11 @@ TARGET_CHANNEL_ID = "1503323760034582538"
 HOOK_DIR = Path(__file__).parent
 
 URL_RE = re.compile(r"https?://[^\s<>\"\)\]]+")
+# Escape hatch: messages starting with `//` or `cmd:` skip idea capture
+# and fall through to the normal agent path. Use this in #灵感 when you
+# want to give an instruction about existing ideas instead of recording
+# a new one (e.g. `// 把 #10 合并到 #8`).
+COMMAND_PREFIX_RE = re.compile(r"^\s*(//|cmd:)", re.IGNORECASE)
 
 
 def _ensure_db() -> sqlite3.Connection:
@@ -88,6 +93,9 @@ async def handle(event_type: str, context: dict):
 
     if not content and not media_paths:
         return None  # nothing to capture
+
+    if content and COMMAND_PREFIX_RE.match(content):
+        return None  # escape hatch: let the agent handle this instruction
 
     urls = URL_RE.findall(content)
 
